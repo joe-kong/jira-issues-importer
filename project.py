@@ -1,6 +1,7 @@
 import os
 from collections import defaultdict
 from html.entities import name2codepoint
+from urllib.parse import unquote
 from dateutil.parser import parse
 import re
 import requests
@@ -138,16 +139,22 @@ class Project:
         # retrieve jira components and labels as github labels (add 'imported-jira-issue' label by default)
         labels = ['imported-jira-issue']
         print(item)
-        for component in item.component:
-            if os.getenv('JIRA_MIGRATION_INCLUDE_COMPONENT_IN_LABELS', 'true') == 'true':
-                labels.append('component:' + proper_label_str(component.text[:40]))
+        try:
+            for component in item.component:
+                if os.getenv('JIRA_MIGRATION_INCLUDE_COMPONENT_IN_LABELS', 'true') == 'true':
+                    labels.append('component:' + proper_label_str(component.text[:40]))
+        except AttributeError:
+            pass  # No components in this issue
 
         labels.append(self._jira_type_mapping(item.type.text.lower()))
 
-        for label in item.labels.findall('label'):
-            converted_label = convert_label(proper_label_str(label.text), self.labels_mapping, self.approved_labels)
-            if converted_label is not None:
-                labels.append(converted_label[:50])
+        try:
+            for label in item.labels.findall('label'):
+                converted_label = convert_label(proper_label_str(label.text), self.labels_mapping, self.approved_labels)
+                if converted_label is not None:
+                    labels.append(converted_label[:50])
+        except AttributeError:
+            pass  # No labels in this issue
 
         labels = list(filter(None, set(labels))) # Unique labels, filter out None
 
@@ -160,18 +167,30 @@ class Project:
         ## imported issue details block
         # metadata: original author & link
         reporter_fullname = item.reporter.text
-        reporter_username = self._proper_jirauser_username(item.reporter.get('username'))
-        reporter = self._username_and_avatar(reporter_username)
+        # Jira Cloud uses 'accountid' instead of 'username'
+        reporter_username = self._proper_jirauser_username(item.reporter.get('username')) or item.reporter.get('accountid')
+        reporter_display = reporter_fullname or reporter_username or 'Unknown'
+        reporter = self._username_and_avatar(reporter_username) if reporter_username and not reporter_username.startswith('JIRAUSER') and item.reporter.get('username') else reporter_display
         issue_url = item.link.text
         issue_title_without_key = item.title.text[item.title.text.index("]") + 2:len(item.title.text)]
         body += f'\n\n---\n<details><summary><i>Originally reported by {reporter}, imported from: <a class="original-jira-link" href="{issue_url}" target="_blank">{issue_title_without_key}</a></i></summary>'
         body += '\n<i><ul>'
 
+        # metadata: reporter (explicit)
+        body += '\n<li><b>reporter</b>: ' + reporter_display
+
+        # metadata: created date
+        try:
+            body += '\n<li><b>created</b>: ' + self._convert_to_iso(item.created.text)
+        except AttributeError:
+            pass
+
         # metadata: assignee
         if item.assignee != 'Unassigned':
             assignee_fullname = item.assignee.text
-            assignee_username = self._proper_jirauser_username(item.assignee.get('username'))
-            assignee = self._username_and_avatar(assignee_username)
+            assignee_username = self._proper_jirauser_username(item.assignee.get('username')) or item.assignee.get('accountid')
+            assignee_display = assignee_fullname or assignee_username or 'Unassigned'
+            assignee = self._username_and_avatar(assignee_username) if assignee_username and not assignee_username.startswith('JIRAUSER') and item.assignee.get('username') else assignee_display
             body += '\n<li><b>assignee</b>: ' + assignee
         else:
             assignee_username = ''
@@ -192,8 +211,11 @@ class Project:
 
         # metadata: components
         components_txt = ''
-        for component in item.component:
-            components_txt += ', ' + component.text if components_txt else component.text
+        try:
+            for component in item.component:
+                components_txt += ', ' + component.text if components_txt else component.text
+        except AttributeError:
+            pass
         if components_txt:
             body += '\n<li><b>component(s)</b>: ' + components_txt
 
@@ -281,13 +303,17 @@ class Project:
             hidden_refs += f'\n<!-- [jira_relationships_epic_key={epic_key}] -->'
         # Putting both username and full name for reporter and assignee in case they differ
         hidden_refs += f'\n<!-- [reporter={reporter_username}] -->'
+        hidden_refs += f'\n<!-- [reporter_fullname={reporter_fullname}] -->'
         if assignee_username:
             hidden_refs += f'\n<!-- [assignee={assignee_username}] -->'
         # Adding the reporter as "author" too in those references
         hidden_refs += f'\n<!-- [author={reporter_username}] -->'
         # components
-        for component in item.component:
-            hidden_refs += f'\n<!-- [jira_component={component.text}] -->'
+        try:
+            for component in item.component:
+                hidden_refs += f'\n<!-- [jira_component={component.text}] -->'
+        except AttributeError:
+            pass
         # labels
         for label in item.labels.findall('label'):
             hidden_refs += f'\n<!-- [jira_label={label.text}] -->'
@@ -320,20 +346,22 @@ class Project:
             del self._project['Issues'][-1]['closed_at']
 
     def _jira_type_mapping(self, issue_type):
-        if issue_type == 'bug':
+        if issue_type in ('bug', 'バグ'):
             return 'bug'
         if issue_type == 'improvement':
             return 'enhancement'
         if issue_type == 'new feature':
             return 'enhancement'
-        if issue_type == 'task':
+        if issue_type in ('task', 'タスク'):
             return 'jira-type:task'
-        if issue_type == 'story':
+        if issue_type in ('story', 'ストーリー'):
             return 'jira-type:story'
         if issue_type == 'patch':
             return 'jira-type:patch'
-        if issue_type == 'epic':
+        if issue_type in ('epic', 'エピック'):
             return 'jira-type:epic'
+        if issue_type in ('sub-task', 'サブタスク'):
+            return 'jira-type:sub-task'
 
     def _convert_to_iso(self, timestamp):
         dt = parse(timestamp)
@@ -541,13 +569,25 @@ class Project:
         if s is None:
             return ''
         s = s.replace(' ' * 8, '')
+        # Decode hexadecimal numeric character references (&#xHHH;)
+        s = re.sub(r'&#x([0-9a-fA-F]+);', lambda m: chr(int(m.group(1), 16)), s)
+        # Decode decimal numeric character references (&#DDD;)
+        s = re.sub(r'&#([0-9]+);', lambda m: chr(int(m.group(1))), s)
+        # Decode named entities
         return re.sub('&(%s);' % '|'.join(name2codepoint),
                       lambda m: chr(name2codepoint[m.group(1)]), s)
 
     def _clean_html(self, s):
         if s is None:
             return ''
+        # Decode URL-encoded characters (e.g., %F0%9F%93%8B for emoji)
+        s = unquote(s)
         s = self._htmlentitydecode(s)
+
+        # Remove emoji from anchor name attributes (they cause rendering issues in GitHub)
+        # This regex removes emoji from <a name="..."> attributes
+        s = re.sub(r'<a name="([^"]*)"></a>', lambda m: f'<a name="{re.sub(r"[\U0001F300-\U0001F9FF\U0001F600-\U0001F64F\U0001F900-\U0001F9FF]", "", m.group(1))}"></a>', s)
+
         # Cleanup of Jira specific markup rendered HTML with non-greedy multiline regexps
         # Handle {code}: need special handling as Jira insert HTML spans for {code} block content highlighting
         s = re.sub(r'<div class="code panel" style="border-width: 1px;"><div class="codeContent panelContent">\n<pre class="code-[^"]*">(.*?)</pre>\n</div></div>', r'\n<pre>\n\1</pre>', s, flags=re.DOTALL)
@@ -564,7 +604,7 @@ class Project:
         return s
 
     def _proper_jirauser_username(self, name):
-        if name.startswith('JIRAUSER') and name in self.jira_fixed_usernames:
+        if name and name.startswith('JIRAUSER') and name in self.jira_fixed_usernames:
             return self.jira_fixed_usernames[name]
         return name
 
@@ -578,7 +618,7 @@ class Project:
                 avatar_path = self.hosted_artifact_base + '/' + self.jira_user_avatars[username]
                 avatar = f'<img align="left" width="20" src="{avatar_path}" title="{username}\'s avatar" /> '
         # No profile page for JIRAUSER* accounts
-        if username.startswith('JIRAUSER') or for_comment:
+        if not username or username.startswith('JIRAUSER') or for_comment:
             profile = username
         else:
             profile = f'<a href="{self.jiraBaseUrl}/secure/ViewProfile.jspa?name={name}">{username}</a>'

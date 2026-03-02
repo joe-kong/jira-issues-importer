@@ -119,7 +119,7 @@ def proper_label_str(label):
     return label.lower().strip().replace(' ', '-').replace("'", '')
 
 def read_xml_file(file_path):
-    with open(file_path) as file:
+    with open(file_path, 'rb') as file:
         return objectify.fromstring(file.read())
 
 
