@@ -197,7 +197,7 @@ class Project:
 
         # metadata: status
         try:
-            body += '\n<li><b>status</b>: ' + item.status
+            body += '\n<li><b>status</b>: ' + item.status.text
         except AttributeError:
             pass
 
@@ -295,6 +295,12 @@ class Project:
         # then don't add jira-type:<type> labels
         issue_type = ' '.join(item.type.text.strip().split())
         hidden_refs += f'\n<!-- [jira_issue_type={issue_type}] -->'
+        # status
+        try:
+            jira_status = item.status.text.strip()
+            hidden_refs += f'\n<!-- [jira_issue_status={jira_status}] -->'
+        except AttributeError:
+            pass
         # epic
         if issue_type == 'Epic':
             hidden_refs += f'\n<!-- [jira_issue_is_epic_key={item.key.text}] -->'
@@ -360,8 +366,11 @@ class Project:
             return 'jira-type:patch'
         if issue_type in ('epic', 'エピック'):
             return 'jira-type:epic'
-        if issue_type in ('sub-task', 'サブタスク'):
+        if issue_type in ('sub-task', 'サブタスク', 'sub task'):
             return 'jira-type:sub-task'
+        # フォールバック: 未知の型名はログ出力してtaskとして扱う
+        print(f'WARNING: Unknown issue type "{issue_type}" -> mapped to jira-type:task')
+        return 'jira-type:task'
 
     def _convert_to_iso(self, timestamp):
         dt = parse(timestamp)
@@ -580,6 +589,34 @@ class Project:
     def _clean_html(self, s):
         if s is None:
             return ''
+
+        # Before decoding, extract emoji from URL-encoded anchor names and restore them
+        # Pattern: <a name="%URLENCODED_EMOJI%..."></a> followed by replacement chars
+        def restore_emoji_in_headings(m):
+            anchor_tag = m.group(1)  # The <a name="..."></a> part
+            after_anchor = m.group(2)  # Content after </a>
+
+            # Extract the URL-encoded name
+            name_match = re.search(r'<a name="([^"]*)"></a>', anchor_tag)
+            if name_match:
+                url_encoded_name = name_match.group(1)
+                try:
+                    # Decode to find emoji
+                    decoded = unquote(url_encoded_name)
+                    # Extract emoji (Unicode characters with code points > 0x1F000)
+                    emoji = ''.join(c for c in decoded if ord(c) > 0x1F000)
+                    if emoji:
+                        # Remove replacement characters from after_anchor and prepend emoji
+                        cleaned_after = after_anchor.lstrip('\ufffd \t')
+                        return anchor_tag + emoji + ' ' + cleaned_after
+                except:
+                    pass
+
+            return anchor_tag + after_anchor
+
+        # Match <a> tag followed by any content (including replacement chars) up to space/text
+        s = re.sub(r'(<a name="[^"]*"></a>)([\ufffd\s]*)', restore_emoji_in_headings, s)
+
         # Decode URL-encoded characters (e.g., %F0%9F%93%8B for emoji)
         s = unquote(s)
         s = self._htmlentitydecode(s)
